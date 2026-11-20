@@ -39,6 +39,7 @@ dependencies = [
   "yt-dlp>=2026.1.1",
   # Transcription
   "faster-whisper>=1.1",
+  "av<18",
   # Reframe
   "mediapipe>=0.10.14",
   # No [opencv] extra: scenedetect 0.7 dropped it and now depends on

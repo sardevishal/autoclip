@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from pathlib import Path
 
 from ..db.models import Clip, new_id
 from ..providers import ClipCandidate, DetectionConfig, LLMProvider, TranscriptWindow
@@ -26,6 +27,15 @@ log = logging.getLogger(__name__)
 #: Window length and overlap in seconds of speech.
 WINDOW_S = 8 * 60
 OVERLAP_S = 60
+
+#: Smaller windows for local models — llama3.1:8b and similar struggle with
+#: 8-minute context dumps. 4 minutes keeps the prompt under ~4k tokens.
+LOCAL_WINDOW_S = 4 * 60
+LOCAL_OVERLAP_S = 30
+
+#: Emergency fallback windows if the primary pass returns nothing.
+FALLBACK_WINDOW_S = 2 * 60
+FALLBACK_OVERLAP_S = 15
 
 #: Two candidates covering this much of the same words are the same clip.
 DEDUPE_IOU = 0.4
@@ -129,13 +139,18 @@ async def detect(
     on_progress: Callable[[float], None] | None = None,
 ) -> list[Clip]:
     """Run detection across the whole transcript and return ranked clips."""
-    windows = build_windows(transcript)
+    # Use smaller windows for local models to stay within their context budget.
+    is_local = provider.name == "ollama"
+    window_s = LOCAL_WINDOW_S if is_local else WINDOW_S
+    overlap_s = LOCAL_OVERLAP_S if is_local else OVERLAP_S
+
+    windows = build_windows(transcript, window_s=window_s, overlap_s=overlap_s)
     if not windows:
         raise HighlightError("The transcript is empty, so there is nothing to clip.")
 
     log.info("Detecting highlights across %d window(s) with %s.", len(windows), provider.name)
 
-    concurrency = LOCAL_CONCURRENCY if provider.name == "ollama" else HOSTED_CONCURRENCY
+    concurrency = LOCAL_CONCURRENCY if is_local else HOSTED_CONCURRENCY
     semaphore = asyncio.Semaphore(concurrency)
     completed = 0
     lock = asyncio.Lock()
@@ -163,6 +178,49 @@ async def detect(
 
     results = await asyncio.gather(*(run_window(w) for w in windows))
     candidates = [c for group in results for c in group]
+
+    if not candidates and is_local:
+        # Fallback: retry with much smaller windows (2-min) and a lenient config
+        # so the model has less text to process and a lower quality bar.
+        log.warning(
+            "Primary pass returned no candidates. Retrying with smaller windows "
+            "(fallback mode for local models)."
+        )
+        lenient_config = DetectionConfig(
+            min_duration_s=config.min_duration_s,
+            max_duration_s=config.max_duration_s,
+            max_clips=config.max_clips,
+            language=config.language,
+            prompt_version="highlight_v1_lenient"
+            if (Path(__file__).resolve().parent.parent / "prompts" / "highlight_v1_lenient.txt").exists()
+            else config.prompt_version,
+            temperature=0.5,  # slightly more creative for the fallback pass
+        )
+        fb_windows = build_windows(
+            transcript,
+            window_s=FALLBACK_WINDOW_S,
+            overlap_s=FALLBACK_OVERLAP_S,
+        )
+        fb_completed = 0
+        fb_semaphore = asyncio.Semaphore(LOCAL_CONCURRENCY)
+
+        async def run_fallback_window(window: TranscriptWindow) -> list[ClipCandidate]:
+            nonlocal fb_completed
+            async with fb_semaphore:
+                try:
+                    result = await provider.detect_highlights(window, lenient_config)
+                    cands = result.clips
+                except Exception as exc:
+                    log.warning("Fallback window %d-%d failed (%s).", window.first_word, window.last_word, exc)
+                    cands = []
+                fb_completed += 1
+                if on_progress:
+                    # Report fallback progress in the second half of the bar
+                    on_progress(0.5 + 0.5 * fb_completed / max(len(fb_windows), 1))
+                return cands
+
+        fb_results = await asyncio.gather(*(run_fallback_window(w) for w in fb_windows))
+        candidates = [c for group in fb_results for c in group]
 
     if not candidates:
         raise HighlightError(

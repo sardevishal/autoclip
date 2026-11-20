@@ -259,6 +259,10 @@ def extract_json_object(raw: str) -> dict[str, Any]:
     in markdown fences, prepend an explanatory sentence, and append a trailing
     note. Falls back to brace matching so a stray character outside the object
     doesn't cost a retry round-trip.
+
+    Also handles Ollama-specific quirks:
+    - Returning the clips array nested under a non-standard key
+    - Wrapping the whole object under a ``response`` key
     """
     text = raw.strip()
     if not text:
@@ -277,6 +281,20 @@ def extract_json_object(raw: str) -> dict[str, Any]:
         return {"clips": parsed}
     if not isinstance(parsed, dict):
         raise ValueError(f"Expected a JSON object, got {type(parsed).__name__}.")
+
+    # Ollama sometimes nests the real object under a "response" key.
+    if "response" in parsed and isinstance(parsed["response"], dict):
+        parsed = parsed["response"]
+
+    # If there's no "clips" key but there's exactly one list value, treat it as clips.
+    if "clips" not in parsed:
+        for key, value in parsed.items():
+            if isinstance(value, list):
+                log.debug("No 'clips' key found; using key %r as clip list.", key)
+                return {"clips": value}
+        # If still nothing, return empty rather than raising — let retry handle it.
+        return {"clips": []}
+
     return parsed
 
 
